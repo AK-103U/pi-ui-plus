@@ -26,7 +26,8 @@
     "pi-ui-plus",
     "pi-agent-notify.ts",
     "assets",
-    "LICENSE"
+    "LICENSE",
+    "README_en.md"
   ],
   "pi": {
     "extensions": [
