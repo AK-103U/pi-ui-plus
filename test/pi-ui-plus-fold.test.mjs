@@ -1,22 +1,14 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { findHostRoot, hostRequire } from "./host.mjs";
 
-const piPath = realpathSync(execFileSync("which", ["pi"], { encoding: "utf8" }).trim());
-let hostRoot = dirname(piPath);
-while (true) {
-	const manifest = resolve(hostRoot, "package.json");
-	if (existsSync(manifest) && JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") break;
-	const parent = dirname(hostRoot);
-	if (parent === hostRoot) throw new Error("Cannot locate Pi's npm installation from PATH");
-	hostRoot = parent;
-}
-const require = createRequire(resolve(hostRoot, "package.json"));
+const hostRoot = findHostRoot();
+const require = hostRequire(hostRoot);
 const hostDir = resolve(hostRoot, "dist");
 const host = (path) => import(pathToFileURL(resolve(hostDir, path)).href);
 const { loadExtensions, createExtensionRuntime } = await host("core/extensions/loader.js");
@@ -145,6 +137,10 @@ function choose(overlay, label) {
 	throw new Error(`Cannot find panel item: ${label}`);
 }
 
+function toolLine(lines, marker = "▶") {
+	return lines.findIndex((line) => line.includes(`─ ${marker} #`));
+}
+
 async function selectBlock(s, label) {
 	label = label.replace("上一轮回复", "本轮最终回复");
 	const promise = s.command("");
@@ -192,9 +188,9 @@ test("tools have separate toggles for their arguments and results", async () => 
 	const second = tool(s, "SECOND_OUTPUT", { name: "bash", args: { command: "run-tests", script: longText("SECOND_ARG") } });
 	s.chat.children.push(first, second);
 	let lines = s.chat.render(80);
-	assert.equal(lines.filter((line) => line.includes("[展开]")).length, 2);
+	assert.equal(lines.filter((line) => /─ ▶ #\d/.test(line)).length, 2);
 	assert.doesNotMatch(lines.join("\n"), /FIRST_OUTPUT|SECOND_OUTPUT|FIRST_ARG_59|SECOND_ARG_59/);
-	assert.ok(s.chat.handleMouse(mouse(lines.findIndex((line) => line.includes("first.ts"))))?.handled);
+	assert.ok(s.chat.handleMouse(mouse(toolLine(lines)))?.handled);
 	assert.match(s.text(), /FIRST_OUTPUT/);
 	assert.match(s.text(4000), /FIRST_ARG_59/);
 	assert.doesNotMatch(s.text(), /SECOND_OUTPUT|SECOND_ARG_59/);
@@ -215,7 +211,7 @@ test("native tool expansion and pi-ui-plus use the same state", async () => {
 	assert.doesNotMatch(s.text(), /OUTPUT_1999/);
 	output.setExpanded(true);
 	const lines = s.chat.render(80);
-	assert.ok(s.chat.handleMouse(mouse(lines.findIndex((line) => line.includes("[收起]"))))?.handled);
+	assert.ok(s.chat.handleMouse(mouse(toolLine(lines, "▼")))?.handled);
 	assert.equal(output.expanded, false);
 	s.dispose();
 });
@@ -233,8 +229,10 @@ test("long user inputs and the current long reply always render in full", async 
 	}
 	const promise = s.command("");
 	const overlay = s.overlays.at(-1);
-	assert.match(panelText(overlay), /第 1 轮 · 当前 · 0 个工具 · 暂无工具/);
+	assert.match(panelText(overlay), /LONG_INPUT_0/);
+	assert.match(panelText(overlay), /当前 · 0 个工具/);
 	overlay.panel.handleInput(key.enter);
+	assert.match(panelText(overlay), /本轮暂无工具/);
 	assert.doesNotMatch(panelText(overlay), /本轮最终回复/);
 	overlay.panel.handleInput(key.escape);
 	overlay.panel.handleInput(key.escape);
@@ -600,7 +598,7 @@ async function closePanel(overlay, promise) {
 	assert.equal(overlay.closed, true);
 }
 
-test("overlay opens on turns, navigates in place, and closes with two-level Escape", async () => {
+test("overlay opens on chats, navigates in place, and closes with two-level Escape", async () => {
 	const s = await setup();
 	fill(s);
 	s.chat.children.push(new UserMessageComponent("第二轮"), tool(s, "ROUND_TWO_OUTPUT"), assistant("最新回复"));
@@ -608,13 +606,13 @@ test("overlay opens on turns, navigates in place, and closes with two-level Esca
 	assert.equal(overlay.options.overlay, true);
 	assert.equal(overlay.options.overlayOptions.anchor, "center");
 	let text = panelText(overlay);
-	assert.match(text, /┌.*\/fold · 选择轮次/);
-	assert.match(text, /第 2 轮 · 当前 · 1 个工具 · 全部收起/);
-	assert.match(text, /第 1 轮 · 1 个工具 · 全部收起/);
-	assert.ok(text.indexOf("第 2 轮") < text.indexOf("第 1 轮"));
-	choose(overlay, "第 1 轮");
+	assert.match(text, /┌.*\/fold · 选择对话/);
+	assert.match(text, /“第二轮” · 当前 · 1 个工具 · 全部收起/);
+	assert.match(text, /“检查并修复这个问题” · 1 个工具 · 全部收起/);
+	assert.ok(text.indexOf("第二轮") < text.indexOf("检查并修复"));
+	choose(overlay, "检查并修复");
 	text = panelText(overlay);
-	assert.match(text, /第 1 轮 · 工具调用/);
+	assert.match(text, /“检查并修复这个问题” · 工具调用/);
 	assert.match(text, /本轮最终回复/);
 	choose(overlay, "read");
 	assert.equal(overlay.closed, false);
@@ -623,14 +621,14 @@ test("overlay opens on turns, navigates in place, and closes with two-level Esca
 	overlay.panel.handleInput(key.escape);
 	assert.equal(overlay.closed, false);
 	text = panelText(overlay);
-	assert.match(text, /→ 第 1 轮 · 1 个工具 · 全部展开/);
+	assert.match(text, /→ “检查并修复这个问题” · 1 个工具 · 全部展开/);
 	overlay.panel.handleInput(key.escape);
 	await promise;
 	assert.equal(overlay.closed, true);
 	s.dispose();
 });
 
-test("turn panel offers individual toggles and reports combined tool state without bulk actions", async () => {
+test("chat panel offers individual toggles and reports combined tool state without bulk actions", async () => {
 	const s = await setup();
 	const first = tool(s, "FIRST_OUTPUT", { args: { path: "first.ts" } });
 	const second = tool(s, "SECOND_OUTPUT", { args: { path: "second.ts" } });
@@ -638,11 +636,11 @@ test("turn panel offers individual toggles and reports combined tool state witho
 	s.chat.children.push(new UserMessageComponent("第一轮"), first, second, assistant(longText("OLD")),
 		new UserMessageComponent("第二轮"), other, assistant(longText("CURRENT")));
 	const { overlay, promise } = openPanel(s);
-	choose(overlay, "第 1 轮");
+	choose(overlay, "第一轮");
 	choose(overlay, "first.ts");
 	overlay.panel.handleInput(key.escape);
-	assert.match(panelText(overlay), /第 1 轮 · 2 个工具 · 部分展开/);
-	choose(overlay, "第 1 轮");
+	assert.match(panelText(overlay), /“第一轮” · 2 个工具 · 部分展开/);
+	choose(overlay, "第一轮");
 	assert.doesNotMatch(panelText(overlay), /本轮工具全部展开|本轮工具全部收起/);
 	choose(overlay, "second.ts");
 	assert.equal(first.expanded, true);
@@ -652,8 +650,8 @@ test("turn panel offers individual toggles and reports combined tool state witho
 	assert.doesNotMatch(s.text(), /OLD_59|OTHER_TURN_OUTPUT/);
 	assert.match(s.text(), /CURRENT_59/);
 	overlay.panel.handleInput(key.escape);
-	assert.match(panelText(overlay), /第 1 轮 · 2 个工具 · 全部展开/);
-	choose(overlay, "第 1 轮");
+	assert.match(panelText(overlay), /“第一轮” · 2 个工具 · 全部展开/);
+	choose(overlay, "第一轮");
 	choose(overlay, "本轮最终回复");
 	assert.match(s.text(), /OLD_59/);
 	choose(overlay, "first.ts");
@@ -663,7 +661,7 @@ test("turn panel offers individual toggles and reports combined tool state witho
 	assert.match(s.text(), /OLD_59/);
 	assert.match(s.text(), /CURRENT_59/);
 	overlay.panel.handleInput(key.escape);
-	assert.match(panelText(overlay), /第 1 轮 · 2 个工具 · 全部收起/);
+	assert.match(panelText(overlay), /“第一轮” · 2 个工具 · 全部收起/);
 	await closePanel(overlay, promise);
 	s.dispose();
 });
@@ -671,11 +669,11 @@ test("turn panel offers individual toggles and reports combined tool state witho
 test("current turn has no reply toggle and an empty conversation has a closable panel", async () => {
 	const s = await setup();
 	let session = openPanel(s);
-	assert.match(panelText(session.overlay), /暂无轮次/);
+	assert.match(panelText(session.overlay), /暂无对话/);
 	await closePanel(session.overlay, session.promise);
 	s.chat.children.push(new UserMessageComponent("当前问题"), assistant(longText("CURRENT")));
 	session = openPanel(s);
-	choose(session.overlay, "第 1 轮");
+	choose(session.overlay, "当前问题");
 	assert.match(panelText(session.overlay), /本轮暂无工具/);
 	assert.doesNotMatch(panelText(session.overlay), /本轮最终回复|工具全部/);
 	await closePanel(session.overlay, session.promise);
@@ -698,7 +696,7 @@ test("opening the panel does not render large tools or replies and keeps termina
 	s.tui.scrollBy = () => { scrollCalls++; };
 	const { overlay, promise } = openPanel(s);
 	panelText(overlay);
-	choose(overlay, "第 1 轮");
+	choose(overlay, "检查并修复");
 	panelText(overlay);
 	await closePanel(overlay, promise);
 	assert.equal(calls, 0);
@@ -713,34 +711,34 @@ test("mouse clicks and wheel input stay within the overlay and maintain its open
 	fill(s);
 	const { overlay, promise } = openPanel(s);
 	panelText(overlay);
-	assert.ok(overlay.panel.handleMouse(mouse(1))?.handled);
-	assert.match(panelText(overlay), /第 1 轮 · 工具调用/);
-	assert.ok(overlay.panel.handleMouse({ ...mouse(1), type: "press" })?.handled);
+	assert.ok(overlay.panel.handleMouse(mouse(4))?.handled);
+	assert.match(panelText(overlay), /工具调用/);
+	assert.ok(overlay.panel.handleMouse({ ...mouse(4), type: "press" })?.handled);
 	panelText(overlay);
-	assert.ok(overlay.panel.handleMouse(mouse(1))?.handled);
+	assert.ok(overlay.panel.handleMouse(mouse(4))?.handled);
 	assert.match(s.text(), /OUTPUT_1999/);
 	assert.equal(overlay.closed, false);
-	assert.ok(overlay.panel.handleMouse({ ...mouse(1), type: "wheel", wheelDelta: 1 })?.handled);
-	assert.match(panelText(overlay).split("\n").find((line) => line.includes("→ ")), /← 返回轮次列表/);
+	assert.ok(overlay.panel.handleMouse({ ...mouse(4), type: "wheel", wheelDelta: 1 })?.handled);
+	assert.match(panelText(overlay).split("\n").find((line) => line.includes("→ ")), /← 返回对话列表/);
 	await closePanel(overlay, promise);
 	s.dispose();
 });
 
-test("long turn and tool lists scroll and resize within the overlay bounds", async () => {
+test("long chat and tool lists scroll and resize within the overlay bounds", async () => {
 	const s = await setup();
 	for (let n = 1; n <= 50; n++) s.chat.children.push(new UserMessageComponent(`第${n}轮`), assistant("回复"));
 	for (let n = 0; n < 40; n++) s.chat.children.push(tool(s, "输出", { args: { path: `中文/👩‍💻/文件${n}.ts` } }));
 	const { overlay, promise } = openPanel(s);
 	assert.match(panelText(overlay), /1\/50/);
 	overlay.panel.handleInput(key.pageDown);
-	assert.match(panelText(overlay), /16\/50/);
+	assert.match(panelText(overlay), /14\/50/);
 	overlay.panel.handleInput(key.end);
-	assert.match(panelText(overlay), /→ 第 1 轮/);
+	assert.match(panelText(overlay), /→ “第1轮”/);
 	overlay.panel.handleInput(key.home);
 	overlay.panel.handleInput(key.enter);
-	assert.match(panelText(overlay), /第 50 轮 · 工具调用/);
+	assert.match(panelText(overlay), /“第50轮” · 工具调用/);
 	overlay.panel.handleInput(key.end);
-	assert.match(panelText(overlay), /→ ← 返回轮次列表/);
+	assert.match(panelText(overlay), /→ ← 返回对话列表/);
 	for (const [width, rows] of [[8, 8], [20, 12], [80, 30], [120, 45], [16, 8]]) {
 		s.tui.terminal.rows = rows;
 		overlay.panel.invalidate();
@@ -757,7 +755,7 @@ test("native expansion and live tool updates appear in the open panel without lo
 	const s = await setup();
 	const { output } = fill(s);
 	const { overlay, promise } = openPanel(s);
-	choose(overlay, "第 1 轮");
+	choose(overlay, "检查并修复");
 	output.setExpanded(true);
 	assert.match(panelText(overlay), /→ ▼ read/);
 	const added = tool(s, "SECOND_OUTPUT", { args: { path: "second.ts" } });
@@ -777,10 +775,10 @@ test("panel honors configured selection keys and Ctrl+C closes from either level
 	fill(s);
 	s.keys.setUserBindings({ "tui.select.confirm": "f2", "tui.select.down": "f3" });
 	const { overlay, promise } = openPanel(s);
-	overlay.panel.handleInput("\x1bOQ"); // F2 enters the turn.
-	assert.match(panelText(overlay), /第 1 轮 · 工具调用/);
+	overlay.panel.handleInput("\x1bOQ"); // F2 enters the chat.
+	assert.match(panelText(overlay), /工具调用/);
 	overlay.panel.handleInput("\x1bOR"); // F3 selects the back action.
-	assert.match(panelText(overlay).split("\n").find((line) => line.includes("→ ")), /← 返回轮次列表/);
+	assert.match(panelText(overlay).split("\n").find((line) => line.includes("→ ")), /← 返回对话列表/);
 	overlay.panel.handleInput("\x03");
 	await promise;
 	assert.equal(overlay.closed, true);
@@ -792,7 +790,7 @@ test("reload, branch navigation and unloading close active panels without hangin
 		const s = await setup();
 		fill(s);
 		const { overlay, promise } = openPanel(s);
-		choose(overlay, "第 1 轮");
+		choose(overlay, "检查并修复");
 		if (event === "dispose") s.dispose(); else await s.emit(event);
 		await promise;
 		assert.equal(overlay.closed, true);
@@ -811,24 +809,24 @@ test("language switches inside the same floating panel and preserves all expansi
 	s.chat.children.push(reply, new UserMessageComponent("中文问题保持原样"), assistant("CURRENT_REPLY"));
 	const before = JSON.stringify(reply.lastMessage);
 	const { overlay, promise } = openPanel(s);
-	choose(overlay, "第 1 轮");
+	choose(overlay, "检查并修复");
 	choose(overlay, "read");
 	choose(overlay, "本轮最终回复");
 	overlay.panel.handleInput(key.escape);
 	assert.match(panelText(overlay), /l English/);
 	overlay.panel.handleInput("l");
 	assert.equal(overlay.closed, false);
-	assert.match(panelText(overlay), /\/fold · Choose a turn/);
+	assert.match(panelText(overlay), /\/fold · Choose a chat/);
 	assert.match(panelText(overlay), /l 简体中文/);
 	assert.doesNotMatch(panelText(overlay), /界面语言|选择|切换|返回/);
-	assert.match(panelText(overlay), /→ Turn 1 · 1 tool · All expanded/);
-	choose(overlay, "Turn 1");
+	assert.match(panelText(overlay), /“检查并修复这个问题” · 1 tool · All expanded/);
+	choose(overlay, "检查并修复");
 	const english = panelText(overlay);
-	assert.match(english, /Turn 1 · Tool calls/);
+	assert.match(english, /Tool calls/);
 	assert.match(english, /l 简体中文/);
-	assert.match(english, /read.*Done \[Collapse\]/);
-	assert.match(english, /Final reply · KEEP_THIS_TEXT \[Collapse\]/);
-	assert.match(english, /Back to turns/);
+	assert.match(english, /read.*Done/);
+	assert.match(english, /Final reply · KEEP_THIS_TEXT/);
+	assert.match(english, /Back to chats/);
 	assert.doesNotMatch(english, /本轮|回复|完成|展开|收起|工具全部/);
 	assert.match(s.text(), /NATIVE_THINKING|UNCHANGED_TAIL|中文问题保持原样/);
 	assert.equal(output.expanded, true);
@@ -836,11 +834,11 @@ test("language switches inside the same floating panel and preserves all expansi
 	assert.equal(reply.thinkingVisibilityOverrides.size, 0);
 	assert.equal(JSON.stringify(reply.lastMessage), before);
 	overlay.panel.handleInput("l");
-	assert.match(panelText(overlay), /第 1 轮 · 工具调用/);
+	assert.match(panelText(overlay), /工具调用/);
 	assert.match(panelText(overlay), /l English/);
 	assert.equal(overlay.closed, false);
 	overlay.panel.handleInput(key.escape);
-	assert.match(panelText(overlay), /第 1 轮 · 1 个工具 · 全部展开/);
+	assert.match(panelText(overlay), /“检查并修复这个问题” · 1 个工具 · 全部展开/);
 	await closePanel(overlay, promise);
 	assert.deepEqual([...s.extension.commands.keys()], ["fold"]);
 	assert.match(s.text(), /UNCHANGED_TAIL/);
@@ -849,12 +847,12 @@ test("language switches inside the same floating panel and preserves all expansi
 
 test("automatic language honors system locale precedence with English fallback", async () => {
 	for (const [env, title] of [
-		[{ LANG: "zh_CN.UTF-8" }, "选择轮次"],
-		[{ LANG: "zh-TW" }, "选择轮次"],
-		[{ LANG: "zh_CN.UTF-8", LC_MESSAGES: "en_US.UTF-8" }, "Choose a turn"],
-		[{ LANG: "en_US.UTF-8", LC_MESSAGES: "en_US.UTF-8", LC_ALL: "zh_HK.UTF-8" }, "选择轮次"],
-		[{ LANG: "zh_CN.UTF-8", LC_ALL: "C" }, "Choose a turn"],
-		[{ LANG: "ja_JP.UTF-8" }, "Choose a turn"],
+		[{ LANG: "zh_CN.UTF-8" }, "选择对话"],
+		[{ LANG: "zh-TW" }, "选择对话"],
+		[{ LANG: "zh_CN.UTF-8", LC_MESSAGES: "en_US.UTF-8" }, "Choose a chat"],
+		[{ LANG: "en_US.UTF-8", LC_MESSAGES: "en_US.UTF-8", LC_ALL: "zh_HK.UTF-8" }, "选择对话"],
+		[{ LANG: "zh_CN.UTF-8", LC_ALL: "C" }, "Choose a chat"],
+		[{ LANG: "ja_JP.UTF-8" }, "Choose a chat"],
 	]) {
 		const s = await withEnvironment({ LANG: undefined, LC_MESSAGES: undefined, LC_ALL: undefined, ...env }, () => setup("tui", "auto"));
 		const { overlay, promise } = openPanel(s);
@@ -868,16 +866,16 @@ test("automatic language honors system locale precedence with English fallback",
 test("explicit environment language overrides detection and l toggles only Chinese and English", async () => {
 	const s = await withEnvironment({ LANG: "zh_CN.UTF-8", LC_MESSAGES: undefined, LC_ALL: undefined }, () => setup("tui", "en"));
 	const { overlay, promise } = openPanel(s);
-	assert.match(panelText(overlay), /Choose a turn/);
+	assert.match(panelText(overlay), /Choose a chat/);
 	overlay.panel.handleInput("l");
-	assert.match(panelText(overlay), /选择轮次/);
+	assert.match(panelText(overlay), /选择对话/);
 	overlay.panel.handleInput("l");
-	assert.match(panelText(overlay), /Choose a turn/);
+	assert.match(panelText(overlay), /Choose a chat/);
 	assert.doesNotMatch(panelText(overlay), /Interface language|界面语言|Automatic|自动/);
 	await closePanel(overlay, promise);
 	const invalid = await withEnvironment({ LANG: "en_US.UTF-8", LC_MESSAGES: undefined, LC_ALL: undefined }, () => setup("tui", "invalid-locale"));
 	const fallback = openPanel(invalid);
-	assert.match(panelText(fallback.overlay), /Choose a turn/);
+	assert.match(panelText(fallback.overlay), /Choose a chat/);
 	await closePanel(fallback.overlay, fallback.promise);
 	invalid.dispose();
 	s.dispose();
@@ -892,12 +890,12 @@ test("language choice persists as a global UI preference across reload and new s
 	await closePanel(opened.overlay, opened.promise);
 	await s.emit("session_start");
 	opened = openPanel(s);
-	assert.match(panelText(opened.overlay), /Choose a turn/);
+	assert.match(panelText(opened.overlay), /Choose a chat/);
 	await closePanel(opened.overlay, opened.promise);
 	s.entries.length = 0;
 	await s.emit("session_start");
 	opened = openPanel(s);
-	assert.match(panelText(opened.overlay), /Choose a turn/);
+	assert.match(panelText(opened.overlay), /Choose a chat/);
 	await closePanel(opened.overlay, opened.promise);
 	s.dispose();
 });
@@ -915,7 +913,7 @@ test("English labels cover tool statuses, errors, notifications and narrow panel
 	pending.updateResult({ content: [{ type: "text", text: "RAW_TOOL_TEXT" }], isError: false, durationMs: 23 });
 	assert.match(strip(s.text()), /bash · 23 ms · run-fixture · Done/);
 	const { overlay, promise } = openPanel(s);
-	choose(overlay, "Turn 1");
+	choose(overlay, "QUESTION");
 	assert.doesNotMatch(panelText(overlay), /Expand all|Collapse all|本轮工具全部/);
 	for (const [width, rows] of [[10, 8], [25, 12], [80, 30]]) {
 		s.tui.terminal.rows = rows;
@@ -941,5 +939,118 @@ test("unknown host layouts retain native display", async () => {
 	await s.emit("session_start");
 	assert.equal(Object.hasOwn(s.chat, "render"), false);
 	assert.match(s.notifications[0], /不兼容/);
+	s.dispose();
+});
+
+function manyReplies(s, count) {
+	const replies = [];
+	for (let n = 1; n <= count; n++) {
+		s.chat.children.push(new UserMessageComponent(`问题${n}`), assistant(longText(`REPLY_${n}`, 3)));
+		replies.push(s.chat.children.at(-1));
+	}
+	return replies;
+}
+
+test("the batch shortcut progressively expands and collapses the most recent replies", async () => {
+	const s = await setup();
+	const replies = manyReplies(s, 6);
+	const replyCount = (text) => (text.match(/上一轮回复/g) ?? []).length;
+	assert.equal(replyCount(s.text()), 5);
+	assert.doesNotMatch(s.text(), /REPLY_[1-5]_2/);
+	const recent = s.extension.shortcuts.get("alt+shift+o");
+	assert.ok(recent);
+	await recent.handler(s.ctx);
+	// Newest three replies (5, 4, 3) expand; the two oldest stay folded.
+	assert.match(s.text(), /REPLY_5_2/);
+	assert.match(s.text(), /REPLY_4_2/);
+	assert.match(s.text(), /REPLY_3_2/);
+	assert.doesNotMatch(s.text(), /REPLY_2_2|REPLY_1_2/);
+	await recent.handler(s.ctx);
+	// The remaining collapsed replies (2, 1) expand on the next press.
+	assert.match(s.text(), /REPLY_2_2/);
+	assert.match(s.text(), /REPLY_1_2/);
+	await recent.handler(s.ctx);
+	// Everything is expanded, so the next press collapses the newest three.
+	assert.doesNotMatch(s.text(), /REPLY_5_2|REPLY_4_2|REPLY_3_2/);
+	assert.match(s.text(), /REPLY_2_2|REPLY_1_2/);
+	assert.equal(replies.at(-1).lastMessage.content[0].text, longText("REPLY_6", 3));
+	s.dispose();
+});
+
+test("the /fold recent command expands a given count and can collapse all replies", async () => {
+	const s = await setup();
+	manyReplies(s, 6);
+	await s.command("recent 2");
+	assert.match(s.text(), /REPLY_5_2/);
+	assert.match(s.text(), /REPLY_4_2/);
+	assert.doesNotMatch(s.text(), /REPLY_3_2|REPLY_2_2|REPLY_1_2/);
+	await s.command("recent off");
+	assert.doesNotMatch(s.text(), /REPLY_[1-5]_2/);
+	assert.equal((s.text().match(/上一轮回复/g) ?? []).length, 5);
+	s.dispose();
+});
+
+test("the settings tab cycles reply folding, batch size, notifications and sound", async () => {
+	const s = await setup();
+	const settingsPath = resolve(s.agentDir, "pi-ui-plus.json");
+	const { overlay, promise } = openPanel(s);
+	overlay.panel.handleInput("\t");
+	let text = panelText(overlay);
+	assert.match(text, /\[设置\]/);
+	assert.match(text, /上一轮回复.*折叠/s);
+	assert.match(text, /批量展开条数.*最近 3 条/s);
+	assert.match(text, /完成通知.*自动（仅 TUI）/s);
+	assert.match(text, /通知声音.*开启/s);
+	assert.match(text, /界面语言.*简体中文/s);
+	// Enter cycles the selected setting (previous replies on -> off).
+	overlay.panel.handleInput(key.enter);
+	assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), { foldReplies: false, recentCount: 3, notify: "auto", notifySound: true });
+	// Arrow down + right cycles the batch size to 4.
+	overlay.panel.handleInput(key.down);
+	overlay.panel.handleInput("\x1b[C");
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).recentCount, 4);
+	overlay.panel.handleInput(key.down);
+	overlay.panel.handleInput(key.enter);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).notify, "on");
+	overlay.panel.handleInput(key.down);
+	overlay.panel.handleInput(key.enter);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).notifySound, false);
+	overlay.panel.handleInput("\x1b");
+	await promise;
+	s.dispose();
+});
+
+test("disabling previous-reply folding keeps historical replies visible and restores on reload", async () => {
+	const s = await setup();
+	const reply = oldReply(s);
+	assert.match(s.text(), /上一轮回复/);
+	assert.doesNotMatch(s.text(), /OLD_REPLY_59/);
+	writeFileSync(resolve(s.agentDir, "pi-ui-plus.json"), JSON.stringify({ foldReplies: false, recentCount: 3, notify: "auto", notifySound: true }));
+	await s.emit("session_start");
+	assert.doesNotMatch(s.text(), /上一轮回复/);
+	assert.match(s.text(), /OLD_REPLY_59/);
+	writeFileSync(resolve(s.agentDir, "pi-ui-plus.json"), JSON.stringify({ foldReplies: true, recentCount: 3, notify: "auto", notifySound: true }));
+	await s.emit("session_start");
+	assert.match(s.text(), /上一轮回复/);
+	assert.doesNotMatch(s.text(), /OLD_REPLY_59/);
+	assert.equal(reply.lastMessage.content[0].text, longText("OLD_REPLY"));
+	s.dispose();
+});
+
+test("the reply order puts the final reply first and drops all expand action labels", async () => {
+	const s = await setup();
+	fill(s);
+	s.chat.children.push(new UserMessageComponent("下一轮"));
+	const { overlay, promise } = openPanel(s);
+	choose(overlay, "检查并修复");
+	const lines = panelText(overlay).split("\n");
+	const reply = lines.findIndex((line) => line.includes("本轮最终回复"));
+	const firstTool = lines.findIndex((line) => line.includes("read"));
+	assert.ok(reply >= 0 && firstTool >= 0 && reply < firstTool, "final reply must precede tools");
+	assert.doesNotMatch(panelText(overlay), /\[展开\]|\[收起\]|\[Expand\]|\[Collapse\]/);
+	assert.doesNotMatch(s.text(), /\[展开\]|\[收起\]/);
+	overlay.panel.handleInput(key.escape);
+	overlay.panel.handleInput(key.escape);
+	await promise;
 	s.dispose();
 });
