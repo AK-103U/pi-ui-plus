@@ -1,6 +1,6 @@
 {
   "name": "@ak-103u/pi-ui-plus",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension package: fold tool calls and previous replies, localize the native Pi UI, and send a system notification when the agent settles.",
   "type": "module",
   "license": "MIT",
