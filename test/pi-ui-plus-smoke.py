@@ -131,18 +131,24 @@ with tempfile.TemporaryDirectory(prefix="pi-ui-plus-smoke-") as temporary:
             terminal.until("展开或收起最近一块工具调用或旧回复", mark)
 
             mark = terminal.send("/fold\r")
-            terminal.until("/fold · 选择轮次", mark)
+            terminal.until("/fold · 选择对话", mark)
             terminal.until("l English", mark)
-            mark = terminal.send(b"\x1b[B\r")
-            terminal.until("第 1 轮 · 工具调用", mark)
+            mark = terminal.send(b"\x1b[B\r")  # Down to the first chat, then enter.
+            terminal.until("QUESTION_1", mark)
+            terminal.until("工具调用", mark)
+            mark = terminal.send(b"\x1b[B")  # Move past the final reply to the tool.
+            terminal.until("▶ read", mark)
             mark = terminal.send("\r")
             terminal.until("▼ read", mark)
             mark = terminal.send("l")
-            terminal.until("Turn 1 · Tool calls", mark)
+            terminal.until("Tool calls", mark)
             terminal.until("l 简体中文", mark)
             assert json.loads((agent / "ui-language.json").read_text()) == {"language": "en"}
             mark = terminal.send(b"\x1b")
-            terminal.until("/fold · Choose a turn", mark)
+            terminal.until("/fold · Choose a chat", mark)
+            mark = terminal.send(b"\t")  # Switch to the settings tab.
+            terminal.until("Settings", mark)
+            terminal.until("Previous replies", mark)
             terminal.send(b"\x1b")
 
             mark = terminal.send("/settings")
@@ -165,10 +171,10 @@ with tempfile.TemporaryDirectory(prefix="pi-ui-plus-smoke-") as temporary:
                 terminal.send(b"\x1b[1;5F")
             terminal.until("Reloaded keybindings", mark)
             mark = terminal.send("/fold\r")
-            terminal.until("/fold · Choose a turn", mark)
+            terminal.until("/fold · Choose a chat", mark)
             terminal.send(b"\x1b")
             mark = terminal.send("/fold")
-            terminal.until("Browse tools and previous replies by turn", mark)
+            terminal.until("Browse chats, tool calls and previous replies", mark)
             terminal.send(b"\x03")  # Clear completion without submitting a message.
             terminal.quit()
         finally:
@@ -179,7 +185,7 @@ with tempfile.TemporaryDirectory(prefix="pi-ui-plus-smoke-") as temporary:
         try:
             terminal.until("RAW_REPLY_2")
             mark = terminal.send("/fold\r")
-            terminal.until("/fold · Choose a turn", mark)
+            terminal.until("/fold · Choose a chat", mark)
             terminal.send(b"\x1b")
             terminal.quit()
         finally:

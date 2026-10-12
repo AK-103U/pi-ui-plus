@@ -1,21 +1,14 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { findHostRoot, hostRequire } from "./host.mjs";
 
-let hostRoot = dirname(realpathSync(execFileSync("which", ["pi"], { encoding: "utf8" }).trim()));
-while (true) {
-	const manifest = resolve(hostRoot, "package.json");
-	if (existsSync(manifest) && JSON.parse(readFileSync(manifest, "utf8")).name === "@earendil-works/pi-coding-agent") break;
-	const parent = dirname(hostRoot);
-	if (parent === hostRoot) throw new Error("Cannot locate the installed Pi npm package");
-	hostRoot = parent;
-}
-const require = createRequire(resolve(hostRoot, "package.json"));
+const hostRoot = findHostRoot();
+const require = hostRequire(hostRoot);
 const host = (path) => import(pathToFileURL(resolve(hostRoot, "dist", path)).href);
 const { loadExtensions, createExtensionRuntime } = await host("core/extensions/loader.js");
 const { createEventBus } = await host("core/event-bus.js");
@@ -100,7 +93,7 @@ const hotkeysSource = "**Navigation**\n| Key | Action |\n|-----|--------|\n| `Ct
 test("one plugin owns only /fold, Alt+O, one widget and one tool resolver", async () => {
 	const s = await setup();
 	assert.deepEqual([...s.extension.commands.keys()], ["fold"]);
-	assert.deepEqual([...s.extension.shortcuts.keys()], ["alt+o"]);
+	assert.deepEqual([...s.extension.shortcuts.keys()], ["alt+o", "alt+shift+o"]);
 	assert.equal(s.extension.toolRenderers.length, 1);
 	assert.equal(s.wrappers.length, 1);
 	assert.equal(s.appended, 0);
@@ -178,7 +171,7 @@ test("l changes folded headers, native hotkeys, settings and slash descriptions 
 	const promise = s.command();
 	s.overlay.panel.render(100);
 	s.overlay.panel.handleInput("l");
-	assert.match(strip(s.overlay.panel.render(100).join("\n")), /Choose a turn/);
+	assert.match(strip(s.overlay.panel.render(100).join("\n")), /Choose a chat/);
 	assert.match(s.text(), /Tool output: collapsed/);
 	assert.match(s.text(), /read.*Done/);
 	assert.match(strip(list.render(100).join("\n")), /Auto-compact/);
@@ -271,12 +264,12 @@ test("global preference survives session restart and invalid preferences fall ba
 	s.overlay.panel.handleInput("\x1b"); await initial;
 	await s.emit("session_start");
 	const promise = s.command();
-	assert.match(strip(s.overlay.panel.render(100).join("\n")), /Choose a turn/);
+	assert.match(strip(s.overlay.panel.render(100).join("\n")), /Choose a chat/);
 	s.overlay.panel.handleInput("\x1b"); await promise;
 	writeFileSync(resolve(s.agentDir, "ui-language.json"), "invalid-json");
 	await s.emit("session_start");
 	const reset = s.command();
-	assert.match(strip(s.overlay.panel.render(100).join("\n")), /选择轮次/);
+	assert.match(strip(s.overlay.panel.render(100).join("\n")), /选择对话/);
 	s.overlay.panel.handleInput("\x1b"); await reset;
 	await s.dispose();
 });
@@ -289,7 +282,7 @@ test("settings write failure reports an error and does not change the current la
 	mkdirSync(resolve(s.agentDir, "ui-language.json"));
 	const promise = s.command();
 	s.overlay.panel.handleInput("l");
-	assert.match(strip(s.overlay.panel.render(100).join("\n")), /选择轮次/);
+	assert.match(strip(s.overlay.panel.render(100).join("\n")), /选择对话/);
 	assert.match(s.notifications.at(-1), /Could not save UI language/);
 	assert.deepEqual(readdirSync(s.agentDir), ["ui-language.json"]);
 	s.overlay.panel.handleInput("\x1b"); await promise;
@@ -307,7 +300,7 @@ test("saved preference beats environment defaults in a newly loaded extension ru
 		const second = await setup("tui", "zh", directory);
 		assert.equal((await suggest(second.provider(), "/settings")).items[0].description, "Open settings menu");
 		const opened = second.command();
-		assert.match(strip(second.overlay.panel.render(100).join("\n")), /Choose a turn/);
+		assert.match(strip(second.overlay.panel.render(100).join("\n")), /Choose a chat/);
 		second.overlay.panel.handleInput("\x1b"); await opened;
 		await second.dispose();
 	} finally { rmSync(directory, { recursive: true, force: true }); }
@@ -321,11 +314,11 @@ test("our command and shortcut descriptions toggle both directions without alter
 	const hotkeys = new Markdown(hotkeysSource + "\n" + own, 0, 0, getMarkdownTheme());
 	s.chat.children = [hotkeys];
 	s.text();
-	assert.equal((await suggest(provider, "/fold")).items[0].description, "[t] Browse tools and previous replies by turn");
+	assert.equal((await suggest(provider, "/fold")).items[0].description, "[t] Browse chats, tool calls and previous replies");
 	const promise = s.command();
 	s.overlay.panel.handleInput("l");
 	s.text();
-	assert.equal((await suggest(provider, "/fold")).items[0].description, "[t] 按轮次查看工具调用和旧回复");
+	assert.equal((await suggest(provider, "/fold")).items[0].description, "[t] 按用户消息查看工具调用和旧回复");
 	assert.match(hotkeys.text, /展开或收起最近一块工具调用或旧回复/);
 	assert.match(hotkeys.text, /Custom third-party message/);
 	s.overlay.panel.handleInput("l");

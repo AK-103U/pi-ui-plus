@@ -1,6 +1,7 @@
 import type { ExtensionContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, MouseRegion, SelectList, matchesKey, truncateToWidth, visibleWidth, type Component, type SelectItem, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type { Language, LanguageStore } from "./language.js";
+import type { SettingsStore } from "./settings.js";
 
 type Content = { type: string; text?: string; thinking?: string };
 type ChatComponent = Component & {
@@ -16,6 +17,8 @@ type ChatComponent = Component & {
 	executionStarted?: boolean;
 	isPartial?: boolean;
 	result?: { isError?: boolean; content?: Content[]; durationMs?: number };
+	/** Raw user message text; UserMessageComponent keeps it at runtime. */
+	text?: string;
 };
 
 function kind(component: Component): string {
@@ -30,6 +33,10 @@ function isTool(component: Component): boolean {
 	return kind(component) === "ToolExecutionComponent";
 }
 
+function isUser(component: Component): boolean {
+	return kind(component) === "UserMessageComponent";
+}
+
 function isSpacer(component: Component): boolean {
 	return kind(component) === "Spacer";
 }
@@ -40,6 +47,11 @@ function hasThinking(component: ChatComponent): boolean {
 
 function shortText(value: unknown): string {
 	return typeof value === "string" ? value.slice(0, 160).replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim() : "";
+}
+
+function userSnippet(component: ChatComponent): string {
+	const first = typeof component.text === "string" ? component.text.split(/\r?\n/, 1)[0] : "";
+	return shortText(first) || shortText(component.text);
 }
 
 export function errorPreview(content: Content[] | undefined, i18n: LanguageStore): string[] {
@@ -99,12 +111,11 @@ class FoldBlock extends Container {
 		super();
 		this.header = new MouseRegion({
 			render: (width) => {
-				const action = this.i18n.t(this.expanded ? "collapse" : "expand");
 				const theme = this.theme();
 				const color = this.errors.length ? "error" : "muted";
 				const prefix = theme.fg(color, `─ ${this.expanded ? "▼" : "▶"} #${this.id} `);
 				const label = styleSummary(this.label, theme, color, this.toolName);
-				const line = truncateToWidth(prefix + label + theme.fg(color, ` [${action}]`), width);
+				const line = truncateToWidth(prefix + label, width);
 				// Keep the old reply navigable with a balanced native prompt marker.
 				const markHeader = this.reply && (!this.expanded || this.members[0] instanceof AssistantSlice);
 				return [markHeader ? "\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07" + line : line];
@@ -143,17 +154,21 @@ class ReplyContinuation extends Container {
 	}
 }
 
-type FoldTurn = { key: Component; number: number; current: boolean; tools: FoldBlock[]; reply?: FoldBlock };
-type PanelItem = SelectItem & { block?: FoldBlock; activate: () => void };
+type FoldTurn = { key: Component; user: string; current: boolean; tools: FoldBlock[]; reply?: FoldBlock };
+type SettingKey = "replies" | "batch" | "notify" | "sound" | "language";
+type PanelItem = SelectItem & { block?: FoldBlock; setting?: SettingKey; activate: () => void };
 
-function turnSummary(turn: FoldTurn, i18n: LanguageStore): string {
+function chatSummary(turn: FoldTurn, i18n: LanguageStore): string {
 	const expanded = turn.tools.filter((tool) => tool.expanded).length;
-	const state = i18n.t(!turn.tools.length ? "noTools" : !expanded ? "allCollapsed" : expanded === turn.tools.length ? "allExpanded" : "partlyExpanded");
-	return `${i18n.t("turn", { number: turn.number })}${turn.current ? ` · ${i18n.t("current")}` : ""} · ${i18n.t(turn.tools.length === 1 ? "toolCountOne" : "toolCount", { count: turn.tools.length })} · ${state}`;
+	const state = i18n.t(!turn.tools.length ? "noTurnTools" : !expanded ? "allCollapsed" : expanded === turn.tools.length ? "allExpanded" : "partlyExpanded");
+	const name = turn.user ? `“${turn.user.slice(0, 48)}”` : i18n.t("finalReply");
+	const count = i18n.t(turn.tools.length === 1 ? "toolCountOne" : "toolCount", { count: turn.tools.length });
+	return `${name}${turn.current ? ` · ${i18n.t("current")}` : ""} · ${count} · ${state}`;
 }
 
 class FoldPanel implements Component {
 	private closed = false;
+	private mode: "chats" | "settings" | "turn" = "chats";
 	private turnKey?: Component;
 	private parentSelection?: string;
 	private list?: SelectList;
@@ -168,32 +183,67 @@ class FoldPanel implements Component {
 		private readonly theme: () => Theme,
 		private readonly i18n: LanguageStore,
 		private readonly keys: KeybindingsManager,
+		private readonly settings: SettingsStore,
 		private readonly done: () => void,
 	) { this.updateList(); }
 
+	private settingValue(key: SettingKey): string {
+		const values = this.settings.current;
+		if (key === "replies") return this.i18n.t(values.foldReplies ? "settingRepliesOn" : "settingRepliesOff");
+		if (key === "batch") return this.i18n.t("settingBatchValue", { count: values.recentCount });
+		if (key === "notify") return this.i18n.t(values.notify === "auto" ? "notifyAuto" : values.notify === "on" ? "notifyOn" : "notifyOff");
+		if (key === "sound") return this.i18n.t(values.notifySound ? "soundOn" : "soundOff");
+		return this.i18n.language === "zh" ? "简体中文" : "English";
+	}
+
+	private cycleSetting(key: SettingKey, direction = 1): void {
+		const values = this.settings.current;
+		if (key === "replies") this.settings.set({ foldReplies: !values.foldReplies });
+		else if (key === "batch") this.settings.set({ recentCount: ((values.recentCount - 1 + direction + 5) % 5) + 1 });
+		else if (key === "notify") {
+			const order = ["auto", "on", "off"] as const;
+			const index = (order.indexOf(values.notify) + direction + order.length) % order.length;
+			this.settings.set({ notify: order[index] });
+		} else if (key === "sound") this.settings.set({ notifySound: !values.notifySound });
+		else this.view.changeLanguage(this.i18n.language === "zh" ? "en" : "zh");
+	}
+
 	private updateList(): void {
 		const selected = this.list?.getSelectedItem()?.value;
-		const turns = this.view.getTurns();
-		const turn = turns.find((item) => item.key === this.turnKey);
-		let vanished = false;
-		if (this.turnKey && !turn) { this.back(); vanished = true; }
-		if (turn) {
-			this.rows = turn.tools.map((block) => this.blockItem(block));
-			if (!turn.tools.length) this.rows.push({ value: "empty", label: this.i18n.t("noTurnTools"), activate() {} });
-			if (turn.reply) this.rows.push(this.blockItem(turn.reply));
-			this.rows.push({ value: "back", label: `← ${this.i18n.t("backToTurns")}`, activate: () => this.back() });
-		} else {
-			this.rows = [...turns].reverse().map((item) => ({
-				value: `turn:${item.number}`, label: turnSummary(item, this.i18n),
-				activate: () => {
-					this.parentSelection = `turn:${item.number}`;
-					this.turnKey = item.key;
-					this.list = undefined;
-				},
+		if (this.mode === "settings") {
+			const keys: SettingKey[] = ["replies", "batch", "notify", "sound", "language"];
+			this.rows = keys.map((key) => ({
+				value: `setting:${key}`,
+				label: `${this.i18n.t(key === "replies" ? "settingReplies" : key === "batch" ? "settingBatch" : key === "notify" ? "settingNotify" : key === "sound" ? "settingSound" : "settingLanguage")}`,
+				setting: key,
+				activate: () => this.cycleSetting(key),
 			}));
-			if (!turns.length) this.rows.push({ value: "empty", label: this.i18n.t("noTurns"), activate() {} });
+		} else {
+			const turns = this.view.getTurns();
+			const turn = turns.find((item) => item.key === this.turnKey);
+			let vanished = false;
+			if (this.mode === "turn" && this.turnKey && !turn) { this.backToChats(); vanished = true; }
+			if (this.mode === "turn" && turn) {
+				this.rows = [];
+				if (turn.reply) this.rows.push(this.blockItem(turn.reply));
+				this.rows.push(...turn.tools.map((block) => this.blockItem(block)));
+				if (!turn.tools.length && !turn.reply) this.rows.push({ value: "empty", label: this.i18n.t("noTurnTools"), activate() {} });
+				this.rows.push({ value: "back", label: `← ${this.i18n.t("backToChats")}`, activate: () => this.backToChats() });
+			} else {
+				this.rows = [...turns].reverse().map((item) => ({
+					value: `turn:${turns.indexOf(item)}`, label: chatSummary(item, this.i18n),
+					activate: () => {
+						this.parentSelection = `turn:${turns.indexOf(item)}`;
+						this.turnKey = item.key;
+						this.mode = "turn";
+						this.list = undefined;
+					},
+				}));
+				if (!turns.length) this.rows.push({ value: "empty", label: this.i18n.t("noChats"), activate() {} });
+			}
+			if (vanished) this.list = undefined;
 		}
-		const signature = JSON.stringify([this.i18n.language, this.maxVisible, ...this.rows.map((row) => [row.value, row.label])]);
+		const signature = JSON.stringify([this.mode, this.i18n.language, this.maxVisible, ...this.rows.map((row) => [row.value, row.label, row.setting ? this.settingValue(row.setting) : ""])]);
 		// Keep the same SelectList across ordinary renders so its pressed mouse
 		// row and selection survive background updates.
 		if (this.list && signature === this.listSignature) return;
@@ -204,17 +254,24 @@ class FoldPanel implements Component {
 			selectedText: (text) => theme.bg("selectedBg", text),
 			description: (text) => theme.fg("muted", text),
 			scrollInfo: (text) => theme.fg("muted", text),
-			noMatch: () => theme.fg("muted", this.i18n.t("noTurns")),
+			noMatch: () => theme.fg("muted", this.i18n.t("noChats")),
 		}, {
 			truncatePrimary: ({ item, maxWidth, isSelected }) => {
-				const block = this.rows.find((row) => row.value === item.value)?.block;
+				const row = this.rows.find((candidate) => candidate.value === item.value);
+				if (row?.setting) {
+					const value = `‹ ${this.settingValue(row.setting)} ›`;
+					const name = theme.fg(isSelected ? "accent" : "text", item.label);
+					const room = Math.max(0, maxWidth - visibleWidth(name) - visibleWidth(value) - 2);
+					return name + " ".repeat(Math.max(1, room)) + theme.fg("muted", value);
+				}
+				const block = row?.block;
 				const text = block && !block.reply
-					? theme.fg("muted", `${block.expanded ? "▼" : "▶"} `) + styleSummary(block.label, theme, block.errors.length ? "error" : "muted", block.toolName) + theme.fg("muted", ` [${this.i18n.t(block.expanded ? "collapse" : "expand")}]`)
+					? theme.fg("muted", `${block.expanded ? "▼" : "▶"} `) + styleSummary(block.label, theme, block.errors.length ? "error" : "muted", block.toolName)
 					: theme.fg(isSelected ? "accent" : "text", item.label);
 				return truncateToWidth(text, maxWidth, "");
 			},
 		});
-		const index = this.rows.findIndex((row) => row.value === (vanished ? undefined : selected ?? (!this.turnKey ? this.parentSelection : undefined)));
+		const index = this.rows.findIndex((row) => row.value === (selected ?? (this.mode === "chats" ? this.parentSelection : undefined)));
 		this.list.setSelectedIndex(Math.max(0, index));
 		this.list.onSelect = (item) => this.activate(item.value);
 	}
@@ -222,7 +279,7 @@ class FoldPanel implements Component {
 	private blockItem(block: FoldBlock): PanelItem {
 		return {
 			value: `block:${block.id}`, block,
-			label: `${block.expanded ? "▼" : "▶"} ${block.reply ? this.i18n.t("finalReply") + block.replySummary : block.label} [${this.i18n.t(block.expanded ? "collapse" : "expand")}]`,
+			label: `${block.expanded ? "▼" : "▶"} ${block.reply ? this.i18n.t("finalReply") + block.replySummary : block.label}`,
 			activate: () => this.view.toggleBlock(block),
 		};
 	}
@@ -233,7 +290,15 @@ class FoldPanel implements Component {
 		this.tui.requestRender();
 	}
 
-	private back(): void {
+	private backToChats(): void {
+		this.mode = "chats";
+		this.turnKey = undefined;
+		this.list = undefined;
+		this.tui.requestRender();
+	}
+
+	private switchTab(): void {
+		this.mode = this.mode === "settings" ? "chats" : "settings";
 		this.turnKey = undefined;
 		this.list = undefined;
 		this.tui.requestRender();
@@ -248,14 +313,19 @@ class FoldPanel implements Component {
 			this.tui.requestRender();
 			return;
 		}
+		if (matchesKey(data, "tab")) { this.switchTab(); return; }
 		if (matchesKey(data, "ctrl+c")) { this.close(); return; }
+		const row = this.rows.find((candidate) => candidate.value === this.list?.getSelectedItem()?.value);
 		if (this.keys.matches(data, "tui.select.cancel")) {
-			if (this.turnKey) { this.back(); this.updateList(); } else this.close();
+			if (this.mode === "turn") { this.backToChats(); this.updateList(); } else this.close();
 		} else if (this.keys.matches(data, "tui.select.confirm")) {
 			const value = this.list?.getSelectedItem()?.value;
 			if (value) this.activate(value);
+		} else if (row?.setting && (matchesKey(data, "left") || matchesKey(data, "right"))) {
+			this.cycleSetting(row.setting, matchesKey(data, "left") ? -1 : 1);
+			this.updateList();
 		} else {
-			const index = Math.max(0, this.rows.findIndex((row) => row.value === this.list?.getSelectedItem()?.value));
+			const index = Math.max(0, this.rows.findIndex((candidate) => candidate.value === this.list?.getSelectedItem()?.value));
 			let next = index;
 			if (this.keys.matches(data, "tui.select.up")) next = (index - 1 + this.rows.length) % this.rows.length;
 			else if (this.keys.matches(data, "tui.select.down")) next = (index + 1) % this.rows.length;
@@ -270,17 +340,26 @@ class FoldPanel implements Component {
 
 	handleMouse(event: TuiMouseEvent) {
 		if (this.closed) return;
-		if (event.type !== "wheel" && (event.y < 1 || event.y > this.listHeight)) return;
-		return this.list?.handleMouse({ ...event, x: event.x - 1, y: event.y - 1, width: Math.max(1, event.width - 2), height: this.listHeight });
+		if (event.type !== "wheel" && (event.y < 4 || event.y > 3 + this.listHeight)) return;
+		return this.list?.handleMouse({ ...event, x: event.x - 1, y: event.y - 4, width: Math.max(1, event.width - 2), height: this.listHeight });
+	}
+
+	private tabBar(): string {
+		const theme = this.theme();
+		const label = (active: boolean, text: string) => active ? theme.fg("accent", theme.bold(`[${text}]`)) : theme.fg("muted", ` ${text} `);
+		return label(this.mode === "settings", this.i18n.t("tabSettings")) + "  " + label(this.mode === "chats" || this.mode === "turn", this.i18n.t("tabChats"));
 	}
 
 	render(width: number): string[] {
 		const height = Math.max(1, Math.min(20, this.tui.terminal.rows - 4));
-		this.maxVisible = Math.max(1, height - 5);
+		// header: top + tab bar + separator. footer: separator + hint + bottom (or just bottom).
+		const available = Math.max(0, height - 3 - (height > 4 ? 3 : 1));
+		// Reserve one row for SelectList's scroll indicator when items overflow.
+		this.maxVisible = Math.max(1, available - 1);
 		this.updateList();
 		const theme = this.theme();
 		const turn = this.view.getTurns().find((item) => item.key === this.turnKey);
-		const title = turn ? `${this.i18n.t("turn", { number: turn.number })} · ${this.i18n.t("toolCalls")}` : this.i18n.t("chooseTurn");
+		const title = this.mode === "settings" ? "/fold" : this.mode === "turn" && turn ? `${turn.user ? `“${turn.user.slice(0, 40)}”` : this.i18n.t("finalReply")} · ${this.i18n.t("toolCalls")}` : this.i18n.t("chooseChat");
 		if (width < 2 || height < 2) return [truncateToWidth(title, width, "")];
 		const inner = width - 2;
 		const border = (text: string) => theme.fg("border", text);
@@ -288,16 +367,16 @@ class FoldPanel implements Component {
 		const heading = truncateToWidth(` ${title} `, inner, "");
 		const top = border("┌") + theme.fg("accent", theme.bold(heading)) + border("─".repeat(Math.max(0, inner - visibleWidth(heading)))) + border("┐");
 		const bottom = border(`└${"─".repeat(inner)}┘`);
+		const hint = this.mode === "settings"
+			? this.i18n.t("settingsHint")
+			: `↑↓ ${this.i18n.t("select")} · ${this.i18n.t("languageHint")} · ${this.keys.getKeys("tui.select.confirm")[0] ?? "enter"} ${this.i18n.t(this.mode === "turn" ? "toggle" : "enter")} · ${this.keys.getKeys("tui.select.cancel")[0] ?? "escape"} ${this.i18n.t(this.mode === "turn" ? "back" : "close")}`;
+		const header = [top, row(` ${this.tabBar()} `), border(`├${"─".repeat(inner)}┤`)];
+		const footer = height > 4 ? [border(`├${"─".repeat(inner)}┤`), row(theme.fg("muted", hint)), bottom] : [bottom];
+		const budget = Math.max(0, height - header.length - footer.length);
 		const items = this.list?.render(Math.max(1, inner)) ?? [];
-		this.listHeight = Math.min(items.length, Math.max(0, height - (height > 4 ? 4 : 2)));
-		const lines = [top, ...items.slice(0, this.listHeight).map(row)];
-		if (height > 4) {
-			const confirm = this.keys.getKeys("tui.select.confirm")[0] ?? "enter";
-			const cancel = this.keys.getKeys("tui.select.cancel")[0] ?? "escape";
-			const hint = `↑↓ ${this.i18n.t("select")} · ${this.i18n.t("languageHint")} · ${confirm} ${this.i18n.t(this.turnKey ? "toggle" : "enter")} · ${cancel} ${this.i18n.t(this.turnKey ? "back" : "close")}`;
-			lines.push(border(`├${"─".repeat(inner)}┤`), row(theme.fg("muted", hint)));
-		}
-		return [...lines, bottom];
+		const shown = items.slice(0, budget);
+		this.listHeight = shown.length;
+		return [...header, ...shown.map(row), ...footer];
 	}
 
 	close(): void { if (!this.closed) { this.closed = true; this.done(); } }
@@ -321,7 +400,14 @@ export class FoldView {
 	private readonly hookedMouse: Container["handleMouse"];
 	private disposed = false;
 
-	constructor(private readonly chat: Container, private readonly tui: TUI, private readonly theme: () => Theme, private readonly i18n: LanguageStore, private readonly saveLanguage: (language: Language) => void) {
+	constructor(
+		private readonly chat: Container,
+		private readonly tui: TUI,
+		private readonly theme: () => Theme,
+		private readonly i18n: LanguageStore,
+		private readonly saveLanguage: (language: Language) => void,
+		private readonly settings: SettingsStore,
+	) {
 		this.renderDescriptor = Object.getOwnPropertyDescriptor(chat, "render");
 		this.mouseDescriptor = Object.getOwnPropertyDescriptor(chat, "handleMouse");
 		this.originalRender = chat.render;
@@ -415,9 +501,10 @@ export class FoldView {
 
 	private previousReplies(): Set<Component> {
 		const previous = new Set<Component>();
+		if (!this.settings.current.foldReplies) return previous;
 		let final: ChatComponent | undefined;
 		for (const child of this.chat.children as ChatComponent[]) {
-			if (kind(child) === "UserMessageComponent") {
+			if (isUser(child)) {
 				if (final) previous.add(final);
 				final = undefined;
 			} else if (isAssistant(child)) {
@@ -435,8 +522,8 @@ export class FoldView {
 		const visible: Component[] = [];
 		let turn: FoldTurn | undefined;
 		for (const child of this.chat.children) {
-			if (kind(child) === "UserMessageComponent" || (!turn && (isTool(child) || isAssistant(child)))) {
-				turn = { key: child, number: turns.length + 1, current: false, tools: [] };
+			if (isUser(child) || (!turn && (isTool(child) || isAssistant(child)))) {
+				turn = { key: child, user: isUser(child) ? userSnippet(child as ChatComponent) : "", current: false, tools: [] };
 				turns.push(turn);
 			}
 			if (isTool(child)) {
@@ -464,11 +551,31 @@ export class FoldView {
 		this.tui.requestRender();
 	}
 
+	/** Expand or collapse the most recent replies, newest first. */
+	recentAction(count: number | "off"): void {
+		this.setEnabled(true);
+		this.project();
+		const replies = this.active.filter((block) => block.reply);
+		if (count === "off") {
+			for (const block of replies) block.setExpanded(false);
+		} else {
+			const collapsed = replies.filter((block) => !block.expanded).slice(-count);
+			if (collapsed.length) for (const block of collapsed) block.setExpanded(true);
+			else for (const block of replies.slice(-count)) block.setExpanded(false);
+		}
+		this.tui.requestRender();
+	}
+
 	changeLanguage(language: Language): void {
 		this.saveLanguage(language);
 	}
 
 	languageChanged(): void {
+		this.refreshTools();
+		this.tui.requestRender();
+	}
+
+	settingsChanged(): void {
 		this.refreshTools();
 		this.tui.requestRender();
 	}
@@ -485,7 +592,7 @@ export class FoldView {
 		this.closePanel = close;
 		try {
 			await ctx.ui.custom<void>((tui, _theme, keys, done) => {
-				panel = new FoldPanel(this, tui, () => ctx.ui.theme, this.i18n, keys, done);
+				panel = new FoldPanel(this, tui, () => ctx.ui.theme, this.i18n, keys, this.settings, done);
 				return panel;
 			}, { overlay: true, overlayOptions: { anchor: "center", width: "85%", maxHeight: "85%", margin: 1 } });
 		} finally {
@@ -511,7 +618,7 @@ export class FoldView {
 	}
 
 	async command(args: string, ctx: ExtensionContext): Promise<void> {
-		const action = args.trim().toLowerCase();
+		const [action, value] = args.trim().toLowerCase().split(/\s+/);
 		if (action === "off" || action === "on") { this.setEnabled(action === "on"); return; }
 		this.project();
 		if (action === "collapse" || action === "expand") {
@@ -521,6 +628,12 @@ export class FoldView {
 			this.setEnabled(true);
 			const block = this.active.at(-1);
 			if (block) block.setExpanded(!block.expanded);
+		} else if (action === "recent") {
+			if (value === "off") this.recentAction("off");
+			else {
+				const count = value ? Number.parseInt(value, 10) : this.settings.current.recentCount;
+				this.recentAction(Number.isFinite(count) ? Math.min(5, Math.max(1, count)) : this.settings.current.recentCount);
+			}
 		} else if (!action) {
 			await this.openPanel(ctx);
 			return;
@@ -546,4 +659,3 @@ export class FoldView {
 		}
 	}
 }
-

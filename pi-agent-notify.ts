@@ -1,11 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-
-type NotifyMode = "auto" | "on" | "off";
-type Backend = "windows" | "linux" | "macos";
+import { readSettings, type NotifyMode } from "./pi-ui-plus/settings.js";
 
 const DEFAULT_TITLE = "Pi";
+type Backend = "windows" | "linux" | "macos";
 const DEFAULT_MESSAGE = "Agent 已完成本轮对话";
 const IMAGE_MESSAGE = "已完成：图片相关任务";
 const MAX_TASK_LENGTH = 56;
@@ -33,9 +32,11 @@ function configuredMessage(fallback: string): string {
 	return envValue("PI_AGENT_NOTIFY_MESSAGE", fallback);
 }
 
-function notifyMode(): NotifyMode {
-	const value = envValue("PI_AGENT_NOTIFY", "auto").toLowerCase();
-	return value === "on" || value === "off" ? value : "auto";
+// Environment variables keep overriding the persisted /fold settings.
+function notifyMode(settings: NotifyMode): NotifyMode {
+	const value = process.env.PI_AGENT_NOTIFY?.trim().toLowerCase();
+	if (value === "on" || value === "off" || value === "auto") return value;
+	return settings;
 }
 
 function isWsl(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
@@ -53,13 +54,15 @@ export function detectBackend(
 }
 
 function shouldNotify(ctx: ExtensionContext): boolean {
-	const mode = notifyMode();
+	const mode = notifyMode(readSettings().notify);
 	if (mode === "off") return false;
 	return mode === "on" || ctx.mode === "tui";
 }
 
 function hasSound(): boolean {
-	return envValue("PI_AGENT_NOTIFY_SOUND", "on").toLowerCase() !== "off";
+	const value = process.env.PI_AGENT_NOTIFY_SOUND?.trim().toLowerCase();
+	if (value === "on" || value === "off") return value !== "off";
+	return readSettings().notifySound;
 }
 
 async function windowsScriptPath(pi: ExtensionAPI): Promise<string | undefined> {
